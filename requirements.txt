@@ -1,8 +1,8 @@
 streamlit
+tensorflow-cpu
+keras
 torch
 torchvision
-tensorflow
-keras
 Pillow
 pandas
 matplotlib
