@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 
 # ==========================================
 # 0. СЛОВАРИ КЛАССОВ (НАЗВАНИЯ ВМЕСТО ИНДЕКСОВ)
@@ -12,6 +12,10 @@ CLASSES_SKIN_KERAS = {
     2: "Меланома",
     3: "Родинка"
 }
+
+# Частоты соответствующих классов в HAM10000. Модель была сильно смещена к
+# доминирующему классу невусов, поэтому перед показом результата убираем prior.
+SKIN_KERAS_CLASS_COUNTS = np.array([514, 1099, 1113, 6705], dtype=np.float32)
 
 CLASSES_SKIN_PYTORCH = {
     0: "Экзема",
@@ -242,17 +246,64 @@ def load_pytorch_model(model_path, num_classes):
         return {"type": "error", "message": str(e)}
 
 
-def preprocess_keras_image(image, target_size=(224, 224), grayscale=False):
+def preprocess_keras_image(
+    image,
+    target_size=(224, 224),
+    grayscale=False,
+    normalization="zero_one",
+):
     if grayscale:
         image = image.convert('L')
     else:
         image = image.convert('RGB')
-    image = image.resize(target_size)
-    image_array = np.array(image) / 255.0
+    image = image.resize(target_size, Image.Resampling.LANCZOS)
+    image_array = np.asarray(image, dtype=np.float32)
+    if normalization == "mobilenet_v2":
+        image_array = image_array / 127.5 - 1.0
+    else:
+        image_array = image_array / 255.0
     if grayscale:
         image_array = np.expand_dims(image_array, axis=-1)
     input_tensor = np.expand_dims(image_array, axis=0)
     return input_tensor
+
+
+def correct_skin_class_bias(probabilities):
+    """Корректирует перекос HAM10000 к доминирующему классу невусов."""
+    probabilities = np.asarray(probabilities, dtype=np.float32)
+    priors = SKIN_KERAS_CLASS_COUNTS / np.sum(SKIN_KERAS_CLASS_COUNTS)
+    corrected = probabilities / priors
+    return corrected / np.sum(corrected)
+
+
+def image_quality_warnings(image):
+    """Находит явно плохие снимки без дополнительных библиотек."""
+    sample = np.asarray(
+        image.convert("L").resize((256, 256)),
+        dtype=np.float32,
+    )
+    brightness = float(np.mean(sample))
+    contrast = float(np.std(sample))
+    center = sample[1:-1, 1:-1]
+    laplacian = (
+        sample[:-2, 1:-1]
+        + sample[2:, 1:-1]
+        + sample[1:-1, :-2]
+        + sample[1:-1, 2:]
+        - 4.0 * center
+    )
+    sharpness = float(np.var(laplacian))
+
+    warnings = []
+    if brightness < 25:
+        warnings.append("снимок слишком тёмный")
+    elif brightness > 235:
+        warnings.append("снимок пересвечен")
+    if contrast < 10:
+        warnings.append("слишком низкий контраст")
+    if sharpness < 15:
+        warnings.append("изображение выглядит размытым")
+    return warnings
 
 
 def preprocess_pytorch_image(image, target_size=(224, 224)):
@@ -273,11 +324,13 @@ def get_image_from_user(label, key):
     with tab_camera:
         camera_photo = st.camera_input(label, key=f"{key}_cam")
         if camera_photo is not None:
-            img = Image.open(camera_photo)
+            with Image.open(camera_photo) as source:
+                img = ImageOps.exif_transpose(source).convert("RGB").copy()
     with tab_file:
         uploaded = st.file_uploader(label, type=["jpg", "png", "jpeg"], key=f"{key}_file")
         if uploaded is not None and img is None:
-            img = Image.open(uploaded)
+            with Image.open(uploaded) as source:
+                img = ImageOps.exif_transpose(source).convert("RGB").copy()
     return img
 
 
@@ -329,12 +382,25 @@ if analysis_type is None:
 if analysis_type == "Кожа":
     st.header("Анализ заболеваний кожи")
 
-    with st.spinner("Первый запуск моделей может занять несколько секунд..."):
-        model_skin_keras = load_keras_model('skin_disease_model_focal_recall_FINAL.keras')
-        pt_skin_result = load_pytorch_model(
-            'final_fine_tuned_medical_model (2).pth',
-            len(CLASSES_SKIN_PYTORCH),
-        )
+    skin_scope = st.segmented_control(
+        "Что видно на фото?",
+        ["Родинка или пятно", "Сыпь, угри или бородавка"],
+        selection_mode="single",
+        default="Родинка или пятно",
+    )
+
+    model_skin_keras = None
+    pt_skin_result = None
+    with st.spinner("Первый запуск модели может занять несколько секунд..."):
+        if skin_scope == "Родинка или пятно":
+            model_skin_keras = load_keras_model(
+                'skin_disease_model_focal_recall_FINAL.keras'
+            )
+        else:
+            pt_skin_result = load_pytorch_model(
+                'final_fine_tuned_medical_model (2).pth',
+                len(CLASSES_SKIN_PYTORCH),
+            )
 
     if isinstance(model_skin_keras, str):
         st.error(f"Ошибка Keras: {model_skin_keras}")
@@ -343,6 +409,14 @@ if analysis_type == "Кожа":
 
     img_skin = get_image_from_user("Снимок кожи", "skin")
     if img_skin:
+        quality_issues = image_quality_warnings(img_skin)
+        if quality_issues:
+            st.warning(
+                "Для более точного результата переснимите фото: "
+                + ", ".join(quality_issues)
+                + "."
+            )
+
         include_skin_heatmap = st.checkbox(
             "Построить карту внимания (медленнее)",
             key="skin_heatmap",
@@ -350,84 +424,99 @@ if analysis_type == "Кожа":
 
         if st.button("Анализировать кожу"):
             with st.spinner("Проводим анализ..."):
-
-                best_confidence = -1.0
-                best_class_name = "Неизвестно"
-                winning_model_name = ""
-                winning_chart_df = None
-                winning_heatmap = None
-
-                # 1. Спрашиваем Keras
                 if model_skin_keras and not isinstance(model_skin_keras, str):
-                    input_k = preprocess_keras_image(img_skin, target_size=(224, 224))
-                    preds_k = model_skin_keras.predict(input_k, verbose=0)
-                    max_prob_k = float(np.max(preds_k[0]))
-                    idx_k = int(np.argmax(preds_k[0]))
-
-                    if max_prob_k > best_confidence:
-                        best_confidence = max_prob_k
-                        best_class_name = CLASSES_SKIN_KERAS.get(idx_k, f"Класс {idx_k}")
-                        winning_model_name = "Keras"
-
-                        # Собираем DataFrame с текстовыми названиями вместо индексов
-                        import pandas as pd
-
-                        winning_chart_df = pd.DataFrame(
-                            {"Уверенность": preds_k[0]},
-                            index=[CLASSES_SKIN_KERAS.get(i, f"Класс {i}") for i in range(len(preds_k[0]))]
+                    input_k = preprocess_keras_image(
+                        img_skin,
+                        target_size=(224, 224),
+                        normalization="mobilenet_v2",
+                    )
+                    raw_probabilities = model_skin_keras.predict(
+                        input_k,
+                        verbose=0,
+                    )[0]
+                    probabilities = correct_skin_class_bias(
+                        raw_probabilities,
+                    )
+                    predicted_idx = int(np.argmax(probabilities))
+                    confidence = float(probabilities[predicted_idx])
+                    class_name = CLASSES_SKIN_KERAS.get(
+                        predicted_idx,
+                        f"Класс {predicted_idx}",
+                    )
+                    heatmap = None
+                    if include_skin_heatmap:
+                        heatmap = generate_keras_gradcam(
+                            model_skin_keras,
+                            input_k,
+                            predicted_idx,
                         )
-                        if include_skin_heatmap:
-                            winning_heatmap = generate_keras_gradcam(model_skin_keras, input_k, idx_k)
+                    class_names = CLASSES_SKIN_KERAS
 
-                # 2. Спрашиваем PyTorch
-                if pt_skin_result and pt_skin_result.get("type") != "error":
+                elif pt_skin_result and pt_skin_result.get("type") != "error":
                     torch, _, _ = get_torch_modules()
                     model_skin_pt = pt_skin_result["model"]
-
                     input_pt = preprocess_pytorch_image(img_skin)
 
-                    # Предсказание
                     with torch.inference_mode():
                         outputs = model_skin_pt(input_pt)
                         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-                        max_prob_pt = float(torch.max(probabilities).item())
-                        idx_pt = torch.argmax(probabilities).item()
-
-                    if max_prob_pt > best_confidence:
-                        best_confidence = max_prob_pt
-                        best_class_name = CLASSES_SKIN_PYTORCH.get(idx_pt, f"Класс {idx_pt}")
-                        winning_model_name = "PyTorch"
-
-                        import pandas as pd
-
-                        winning_chart_df = pd.DataFrame(
-                            {"Уверенность": probabilities.numpy()},
-                            index=[CLASSES_SKIN_PYTORCH.get(i, f"Класс {i}") for i in range(len(probabilities))]
+                        predicted_idx = int(torch.argmax(probabilities).item())
+                        confidence = float(probabilities[predicted_idx].item())
+                        probabilities = probabilities.numpy()
+                    class_name = CLASSES_SKIN_PYTORCH.get(
+                        predicted_idx,
+                        f"Класс {predicted_idx}",
+                    )
+                    heatmap = None
+                    if include_skin_heatmap:
+                        heatmap = generate_pytorch_gradcam(
+                            model_skin_pt,
+                            input_pt,
+                            predicted_idx,
                         )
-                        # Генерация Grad-CAM для PyTorch
-                        if include_skin_heatmap:
-                            winning_heatmap = generate_pytorch_gradcam(model_skin_pt, input_pt, idx_pt)
+                    class_names = CLASSES_SKIN_PYTORCH
+                else:
+                    probabilities = None
 
-                # 3. Вывод результатов
-                if best_confidence > -1.0:
-                    st.success(f"**Итоговый диагноз:** {best_class_name}")
-                    st.info(f"Уверенность: **{best_confidence * 100:.1f}%** (Выбрана модель {winning_model_name})")
+                if probabilities is not None:
+                    sorted_probabilities = np.sort(np.asarray(probabilities))
+                    margin = float(
+                        sorted_probabilities[-1] - sorted_probabilities[-2]
+                    )
+                    if confidence < 0.55 or margin < 0.10:
+                        st.warning(
+                            f"**Предварительный результат:** {class_name}. "
+                            "Модель не уверена — сделайте ещё одно чёткое фото "
+                            "при ровном освещении."
+                        )
+                    else:
+                        st.success(f"**Предварительный результат:** {class_name}")
+                    st.info(f"Уверенность модели: **{confidence * 100:.1f}%**")
 
-                    if winning_heatmap is not None:
+                    if heatmap is not None:
                         col_img1, col_img2 = st.columns(2)
                         with col_img1:
                             st.image(img_skin, caption="Исходный снимок", width="stretch")
                         with col_img2:
-                            heatmap_overlay = overlay_heatmap(img_skin, winning_heatmap)
+                            heatmap_overlay = overlay_heatmap(img_skin, heatmap)
                             st.image(heatmap_overlay, caption="Карта внимания модели (Grad-CAM)",
                                      width="stretch")
                     else:
                         st.image(img_skin, caption="Исходный снимок", width="stretch")
 
+                    import pandas as pd
+
+                    chart_df = pd.DataFrame(
+                        {"Уверенность": probabilities},
+                        index=[
+                            class_names.get(i, f"Класс {i}")
+                            for i in range(len(probabilities))
+                        ],
+                    )
                     st.subheader("Распределение вероятностей")
-                    st.bar_chart(winning_chart_df)
+                    st.bar_chart(chart_df)
                 else:
-                    st.error("Не удалось получить предсказания ни от одной из моделей.")
+                    st.error("Не удалось получить предсказание модели.")
 
 # --- ВКЛАДКА 2: НОГТИ ---
 if analysis_type == "Ногти":

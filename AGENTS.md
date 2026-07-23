@@ -11,4 +11,8 @@
 - Normal launch opens only HTTPS MIRA. The temporary certificate page starts only with `MIRA.py --certificate`.
 - Never serve or commit private keys from `.runtime`; only the public CA may be exported.
 - Keep Grad-CAM optional because it adds CPU work.
+- The pigmented-lesion Keras model uses MobileNetV2 `[-1, 1]` preprocessing and
+  HAM10000 prior correction; do not compare its raw softmax with the disjoint
+  PyTorch skin model.
 - For details about mobile serving, read `.codex/notes/mobile-local-server.md`.
+- For skin-model inference details, read `.codex/notes/skin-model-inference.md`.
